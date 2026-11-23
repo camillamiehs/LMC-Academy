@@ -1,0 +1,12 @@
+# Private: handbook content and source documents never go in this public repo
+private/
+handbook/
+prototype/
+*.json.bak
+# Test output
+tests/node_modules/
+tests/shots/
+tests/package-lock.json
+firestore-debug.log
+*-debug.log
+.DS_Store

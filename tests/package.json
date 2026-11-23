@@ -1,0 +1,14 @@
+{
+  "name": "lmc-academy-tests",
+  "version": "1.0.0",
+  "description": "End-to-end tests for LMC Academy (Firebase emulators + Playwright)",
+  "scripts": {
+    "test": "firebase emulators:exec --project demo-lmc --only auth,firestore --config ../firebase.json \"node academy-e2e.js\""
+  },
+  "license": "UNLICENSED",
+  "dependencies": {
+    "firebase": "^10.14.1",
+    "firebase-tools": "^13.35.1"
+  },
+  "private": true
+}

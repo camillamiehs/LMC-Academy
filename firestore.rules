@@ -1,0 +1,28 @@
+rules_version = '2';
+// LMC Academy security rules.
+// - Only people on the invite list (collection "allow", document id = lower-case email) can read the content or save progress.
+// - Everyone can read and write only their own progress. Admins (role "admin" on their invite) can read everyone's progress,
+//   manage invites and load new content.
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() { return request.auth != null && request.auth.token.email != null && request.auth.token.email_verified == true; }
+    function myEmail() { return request.auth.token.email.lower(); }
+    function invited() { return signedIn() && exists(/databases/$(database)/documents/allow/$(myEmail())); }
+    function isAdmin() { return invited() && get(/databases/$(database)/documents/allow/$(myEmail())).data.role == 'admin'; }
+
+    match /allow/{email} {
+      allow read: if isAdmin() || (signedIn() && email == myEmail());
+      allow create, update: if isAdmin() && email == email.lower() && request.resource.data.role in ['learner', 'admin'];
+      allow delete: if isAdmin() && email != myEmail();
+    }
+    match /content/{doc} {
+      allow read: if invited();
+      allow write: if isAdmin();
+    }
+    match /progress/{uid} {
+      allow read: if (invited() && request.auth.uid == uid) || isAdmin();
+      allow create, update: if invited() && request.auth.uid == uid && request.resource.data.email == myEmail();
+      allow delete: if isAdmin();
+    }
+  }
+}
