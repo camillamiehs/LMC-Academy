@@ -16,8 +16,8 @@ Also make sure the Claude GitHub app can see the new repo: **github.com/settings
 
 Firebase is Google's service for sign-in and the progress database. Use your Google account.
 
-1. Go to **console.firebase.google.com** → **Create a project** → name it **lmc-academy**. Google Analytics: **off**.
-2. **Upgrade to the Blaze plan** (bottom-left, "Upgrade"). It needs a card, but at our size it costs **0 USD**.
+1. Go to **console.firebase.google.com** → **Create a project**. If you already have a Google Cloud project you want to use, pick it under **"Add Firebase to a Google Cloud project"**. Otherwise name a new one **lmc-academy**. Google Analytics: **off**.
+2. **Upgrade to the Blaze plan** (bottom-left, "Upgrade"). If your Google Cloud already has a billing account, just select it. At our size it costs **0 USD**.
    Why: the free plan only sends **5 sign-in emails a day**, which isn't enough for 15 people on launch day.
    Then set a budget alert: Google Cloud → Billing → Budgets & alerts → **1 USD**, so you're warned if anything ever costs money.
 3. **Sign-in:** Build → **Authentication** → Get started → **Email/Password** → turn on **Email link (passwordless sign-in)** → Save.
