@@ -1,16 +1,15 @@
 /* LMC Academy: "Going the Last Mile" as short learning journeys, with named progress tracking.
-   Plain JavaScript + Firebase (email-link sign-in, Firestore). No build step.
-   Data (Firestore):
-     allow/{email}      invite list: { name, role: "learner"|"admin", invitedAt, invitedBy }
-     content/current   { version, json (the modules as a JSON string), updatedAt, updatedBy }
-     progress/{uid}    { email, name, createdAt, lastActive, modules: { "3_1": {...} } }
+   Plain JavaScript, no build step. Hosted on GitHub Pages.
+   Backend: a Google Apps Script web app bound to a Google Sheet (see apps-script/Code.gs):
+     Invites sheet (who may sign in), Progress sheet (one row per person per module), content as a private JSON file in Drive.
+   Sign-in: an emailed link with a signed token; the app keeps a session token in this browser.
    The handbook content is NOT in this repository: an admin loads it from a file on the Admin → Content tab. */
 (function () {
   "use strict";
-  var CFG = window.LMC_FIREBASE || {};
-  var EMU = window.LMC_EMULATOR || null; // { auth: "http://127.0.0.1:9099", firestore: ["127.0.0.1", 8080] } in tests only
+  var API = window.LMC_API || "";
+  var TEST = !!window.LMC_TEST; // tests only: allows time travel via localStorage "lmcShift"
   var app = document.getElementById("app");
-  var S = { user: null, invite: null, isAdmin: false, content: null, prog: null, saving: null, adminCache: null, playing: null };
+  var S = { session: "", invite: null, isAdmin: false, content: null, prog: null, saving: null, adminCache: null, playing: null };
   var LOGO = '<svg width="30" height="26" viewBox="0 0 30 26" aria-hidden="true"><path d="M3 3l8 10-8 10M12 3l8 10-8 10" fill="none" stroke="#682813" stroke-width="3" stroke-linejoin="round"/><path d="M25 2v22" stroke="#682813" stroke-width="3"/></svg>';
   var TAPE = '<svg class="tape" viewBox="0 0 420 150" aria-hidden="true"><g stroke-width="14"><path d="M10 120l60-26" stroke="#E64904"/><path d="M70 94l70-20" stroke="#B1CAD6"/><path d="M140 74l50-34" stroke="#4E7445"/><path d="M190 40l60 10" stroke="#F8D3C0"/><path d="M250 50l40-36" stroke="#FDC201"/><path d="M290 14l70 18" stroke="#B1CAD6"/><path d="M360 32l40-26" stroke="#4E7445"/><path d="M228 118l52-30" stroke="#FDC201"/><path d="M280 88l64 6" stroke="#E64904"/></g></svg>';
   var AVC = ["#3E6580", "#E64904", "#4E7445", "#682813", "#8A6A55", "#B23B1E", "#2A1810", "#A66F00"];
@@ -20,7 +19,7 @@
   /* ---------- helpers ---------- */
   function esc(s) { return String(s == null ? "" : s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;"); }
   function store(k, v) { try { if (v === undefined) return localStorage.getItem(k) || ""; if (v === null) localStorage.removeItem(k); else localStorage.setItem(k, v); } catch (e) {} return ""; }
-  function NOW() { var shift = EMU ? (+store("lmcShift") || 0) : 0; return Date.now() + shift; }
+  function NOW() { var shift = TEST ? (+store("lmcShift") || 0) : 0; return Date.now() + shift; }
   function key(id) { return String(id).replace(/\./g, "_"); }
   function hash(s) { var h = 0; for (var i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) | 0; return Math.abs(h); }
   function av(name) { var n = String(name || "?").trim() || "?"; var ini = n.split(/\s+/).map(function (w) { return w[0]; }).join("").slice(0, 2).toUpperCase(); return '<span class="av" style="--avc:' + AVC[hash(n) % AVC.length] + '">' + esc(ini) + "</span>"; }
@@ -39,23 +38,39 @@
   function isDone(p) { return p && p.status === "done"; }
   function isGold(p) { return isDone(p) && p.postcards && p.postcards.w1 && p.postcards.w1.doneAt; }
 
-  /* ---------- Firebase ---------- */
-  var fb, auth, db;
-  try {
-    fb = firebase.initializeApp(CFG);
-    auth = firebase.auth(); db = firebase.firestore();
-    if (EMU) { auth.useEmulator(EMU.auth); db.useEmulator(EMU.firestore[0], EMU.firestore[1]); }
-  } catch (e) {
-    app.innerHTML = '<div class="center card"><h2>Setup needed</h2><p>The Firebase settings in <code>firebase-config.js</code> are missing or wrong. See SETUP.md.</p><p class="err">' + esc(e.message) + "</p></div>";
+  /* ---------- backend (Google Apps Script) ---------- */
+  if (!/^https:\/\/|^http:\/\/127\.0\.0\.1/.test(API)) {
+    app.innerHTML = '<div class="center card"><h2>Setup needed</h2><p>The web app address in <code>config.js</code> is missing. See SETUP.md.</p></div>';
     return;
   }
-  var save = function () {
-    if (!S.user || !S.prog) return Promise.resolve();
-    S.prog.lastActive = NOW();
-    var data = JSON.parse(JSON.stringify(S.prog));
-    S.saving = db.collection("progress").doc(S.user.uid).set(data).catch(function (e) { toast("Couldn't save. Check your connection; we'll try again."); console.error(e); });
-    return S.saving;
-  };
+  function api(action, payload) {
+    payload = payload || {}; payload.action = action; if (S.session && !payload.session) payload.session = S.session;
+    return fetch(API, { method: "POST", headers: { "Content-Type": "text/plain;charset=utf-8" }, body: JSON.stringify(payload), redirect: "follow" })
+      .then(function (r) { if (!r.ok) throw new Error("The Academy server answered " + r.status + "."); return r.json(); })
+      .then(function (j) {
+        if (j && j.error) { var e = new Error(j.error === "NOT_INVITED" ? "This email isn’t on the invite list." : j.error); e.code = j.error; throw e; }
+        return j;
+      });
+  }
+  /* Saves only the modules that changed, one request at a time, in order. */
+  S.snap = {}; S.chain = Promise.resolve(); var saveTimer = null;
+  function changed() { var out = []; Object.keys(S.prog ? S.prog.modules : {}).forEach(function (k) { var j = JSON.stringify(S.prog.modules[k]); if (S.snap[k] !== j) out.push([k, j]); }); return out; }
+  function flush() {
+    if (!S.session || !S.prog) return S.chain;
+    changed().forEach(function (c) {
+      S.snap[c[0]] = c[1];
+      S.chain = S.chain.then(function () { return api("save", { key: c[0], data: JSON.parse(c[1]) }); }).catch(function (e) {
+        delete S.snap[c[0]]; toast("Couldn’t save just now. We’ll try again on your next step."); console.error(e);
+      });
+    });
+    return S.chain;
+  }
+  var save = function () { clearTimeout(saveTimer); saveTimer = setTimeout(flush, 400); return S.chain; };
+  function beaconFlush() { // when the tab closes: send what's left without waiting
+    if (!S.session || !S.prog) return;
+    changed().forEach(function (c) { S.snap[c[0]] = c[1]; try { navigator.sendBeacon(API, new Blob([JSON.stringify({ action: "save", session: S.session, key: c[0], data: JSON.parse(c[1]) })], { type: "text/plain;charset=utf-8" })); } catch (e) {} });
+  }
+  function signOut() { store("lmcSession", null); S.session = ""; S.prog = S.content = null; S.adminCache = null; vSignin(); }
 
   /* ---------- chrome ---------- */
   function appbar(active) {
@@ -65,7 +80,7 @@
       '<nav class="tabs" aria-label="Main">' + tabs.map(function (t) { return '<a href="' + t[0] + '" aria-current="' + (active === t[0] ? "page" : "false") + '">' + t[1] + "</a>"; }).join("") + "</nav>" +
       '<span class="me">' + av(S.prog.name) + '<span style="display:flex;flex-direction:column;line-height:1.2">' + esc(S.prog.name) + '<button id="out" type="button">Sign out</button></span></span></div>';
   }
-  function wireBar() { var o = $("#out"); if (o) o.addEventListener("click", function () { auth.signOut(); }); }
+  function wireBar() { var o = $("#out"); if (o) o.addEventListener("click", function () { flush().then(signOut, signOut); }); }
   function show(html, active) { app.innerHTML = (active === null ? "" : appbar(active)) + html; wireBar(); window.scrollTo(0, 0); }
 
   /* ---------- sign in ---------- */
@@ -79,40 +94,40 @@
     $("#f").addEventListener("submit", function (e) {
       e.preventDefault(); var em = $("#em").value.trim().toLowerCase(); if (!em) return;
       $("#send").disabled = true;
-      auth.sendSignInLinkToEmail(em, { url: location.origin + location.pathname, handleCodeInApp: true }).then(function () {
-        store("lmcEmail", em); vSignin("<strong>Check your inbox.</strong> We sent a sign-in link to <b>" + esc(em) + "</b>. Open it on this device. It works once.");
+      api("requestLink", { email: em }).then(function (r) {
+        store("lmcEmail", em);
+        if (r.sent) vSignin("<strong>Check your inbox.</strong> We sent a sign-in link to <b>" + esc(em) + "</b>. It works for an hour. Check your spam folder if it doesn’t show up.");
+        else vSignin("", em + " isn’t on the LMC Academy invite list. Check the spelling, or ask Camilla, Jakob or Brian to add you.");
       }).catch(function (er) { vSignin("", "We couldn't send the link: " + er.message); });
     });
   }
-  var PRIVACY = "We record which modules you open and finish, your time on each (only while the page is open), your answers and scores, policy sign-offs with date and time, and which documents you open from the modules. Only you and the Academy admins can see it. It's there to support onboarding, not for performance ratings. It's stored in the EU with Google Firebase.";
-  function vConfirmEmail() {
-    app.innerHTML = '<section class="card center view"><p class="eyebrow">One more step</p><h2>Confirm your email</h2><p class="muted">You opened the sign-in link on a different device or browser. Type the email you used.</p><form id="f" style="display:flex;flex-direction:column;gap:10px"><label class="f" for="em">Work email<input id="em" type="email" required></label><button class="btn go" type="submit">Sign in</button></form></section>';
-    $("#f").addEventListener("submit", function (e) { e.preventDefault(); finishLink($("#em").value.trim().toLowerCase()); });
-  }
-  function finishLink(email) {
-    auth.signInWithEmailLink(email, location.href).then(function () {
-      store("lmcEmail", email); history.replaceState(null, "", location.pathname + (location.hash || ""));
-    }).catch(function (er) { history.replaceState(null, "", location.pathname); vSignin("", "That sign-in link didn't work (" + er.code + "). Links work once and expire after a while. Request a new one."); });
+  var PRIVACY = "We record which modules you open and finish, your time on each (only while the page is open), your answers and scores, policy sign-offs with date and time, and which documents you open from the modules. Only you and the Academy admins can see it. It's there to support onboarding, not for performance ratings. It's stored in a Google Sheet in the Academy owner’s Google account (Google Workspace).";
+  function finishLink(token) {
+    app.innerHTML = '<div class="center card" style="align-items:center"><span class="spinner" aria-hidden="true"></span><p class="muted">Signing you in…</p></div>';
+    api("exchange", { login: token }).then(function (r) {
+      store("lmcSession", r.session); store("lmcEmail", r.email); S.session = r.session;
+      history.replaceState(null, "", location.pathname + (location.hash || "")); boot();
+    }).catch(function (er) { history.replaceState(null, "", location.pathname); vSignin("", er.message + " Request a new link below."); });
   }
   function vNotInvited() {
-    app.innerHTML = '<section class="card center view"><p class="eyebrow">Not on the list yet</p><h2>You’re signed in as ' + esc(S.user.email) + '</h2><p>This email isn’t on the LMC Academy invite list. Ask Camilla, Jakob or Brian to add you, then sign in again.</p><div class="btns"><button class="btn" id="o">Sign out</button></div></section>';
-    $("#o").addEventListener("click", function () { auth.signOut(); });
+    app.innerHTML = '<section class="card center view"><p class="eyebrow">Not on the list yet</p><h2>' + esc(store("lmcEmail") || "Your email") + ' isn’t on the list</h2><p>This email isn’t on the LMC Academy invite list (any more). Ask Camilla, Jakob or Brian to add you, then sign in again.</p><div class="btns"><button class="btn" id="o">Sign out</button></div></section>';
+    $("#o").addEventListener("click", signOut);
   }
 
   /* ---------- load after sign-in ---------- */
-  function boot(user) {
-    S.user = user; var email = user.email.toLowerCase();
-    db.collection("allow").doc(email).get().then(function (inv) {
-      if (!inv.exists) { vNotInvited(); return; }
-      S.invite = inv.data(); S.isAdmin = S.invite.role === "admin";
-      return Promise.all([db.collection("content").doc("current").get(), db.collection("progress").doc(user.uid).get()]).then(function (r) {
-        S.content = r[0].exists ? JSON.parse(r[0].data().json) : null;
-        S.contentVersion = r[0].exists ? r[0].data().version : "";
-        S.prog = r[1].exists ? r[1].data() : { email: email, name: S.invite.name || email, createdAt: NOW(), modules: {} };
-        S.prog.email = email; if (S.invite.name) S.prog.name = S.invite.name; S.prog.modules = S.prog.modules || {};
-        save(); route();
-      });
-    }).catch(function (e) { app.innerHTML = '<div class="center card"><h2>Something went wrong</h2><p class="err">' + esc(e.message) + '</p><button class="btn" id="o">Sign out</button></div>'; $("#o").addEventListener("click", function () { auth.signOut(); }); });
+  function boot() {
+    api("me").then(function (r) {
+      S.invite = { name: r.name, role: r.role }; S.isAdmin = r.role === "admin";
+      S.content = r.content ? JSON.parse(r.content) : null; S.contentVersion = r.contentVersion || "";
+      S.prog = { email: r.email, name: r.name, modules: r.modules || {} };
+      S.snap = {}; Object.keys(S.prog.modules).forEach(function (k) { S.snap[k] = JSON.stringify(S.prog.modules[k]); });
+      route();
+    }).catch(function (e) {
+      if (e.code === "NOT_INVITED") { store("lmcSession", null); S.session = ""; return vNotInvited(); }
+      if (/sign in again/i.test(e.message)) return signOut();
+      app.innerHTML = '<div class="center card"><h2>Something went wrong</h2><p class="err">' + esc(e.message) + '</p><div class="btns"><button class="btn go" id="again">Try again</button><button class="btn alt" id="o">Sign out</button></div></div>';
+      $("#again").addEventListener("click", boot); $("#o").addEventListener("click", signOut);
+    });
   }
 
   /* ---------- router ---------- */
@@ -156,8 +171,8 @@
   var timer = { at: 0 };
   function tick() { if (!S.playing) return; var p = mp(S.playing, false); if (!p) return; var t = NOW(); if (timer.at && document.visibilityState === "visible") p.timeSec = (p.timeSec || 0) + Math.min(180, (t - timer.at) / 1000); timer.at = t; }
   function stopTimer() { tick(); S.playing = null; timer.at = 0; save(); }
-  document.addEventListener("visibilitychange", function () { if (!S.playing) return; if (document.visibilityState === "hidden") { tick(); save(); } else timer.at = NOW(); });
-  window.addEventListener("pagehide", function () { if (S.playing) { tick(); save(); } });
+  document.addEventListener("visibilitychange", function () { if (document.visibilityState === "hidden") { if (S.playing) tick(); flush(); } else if (S.playing) timer.at = NOW(); });
+  window.addEventListener("pagehide", function () { if (S.playing) tick(); beaconFlush(); });
   function flow(m) {
     var f = [{ k: "departure", st: 0 }];
     m.steps.forEach(function (s, i) { f.push({ k: s.type, s: s, i: i, st: s.type === "case" ? 2 : 1 }); });
@@ -291,7 +306,7 @@
       if (m.postcards.every(function (_, i) { return S.pcAns.a[i] !== undefined; })) {
         var r = m.postcards.filter(function (q, i) { return S.pcAns.a[i] === q.a; }).length;
         c.tries = (c.tries || 0) + 1; if (c.firstCorrect === undefined) { c.firstCorrect = r; c.total = m.postcards.length; }
-        if (r === m.postcards.length) c.doneAt = NOW(); else c.dueAt = NOW() + 3 * DAY;
+        if (r === m.postcards.length) c.doneAt = NOW(); else { c.dueAt = NOW() + 3 * DAY; delete c.remindedAt; }
         save();
       }
       vPostcard(m, w);
@@ -308,11 +323,10 @@
   /* ---------- admin ---------- */
   function loadAdmin(force) {
     if (S.adminCache && !force) return Promise.resolve(S.adminCache);
-    return Promise.all([db.collection("allow").get(), db.collection("progress").get()]).then(function (r) {
-      var invites = r[0].docs.map(function (d) { var x = d.data(); x.email = d.id; return x; });
-      var progs = r[1].docs.map(function (d) { var x = d.data(); x.uid = d.id; return x; });
-      var people = invites.map(function (i) { var pr = progs.filter(function (p) { return p.email === i.email; })[0]; return { email: i.email, name: i.name || i.email, role: i.role, invitedAt: i.invitedAt, prog: pr }; });
-      progs.forEach(function (p) { if (!invites.some(function (i) { return i.email === p.email; })) people.push({ email: p.email, name: p.name, role: "removed", prog: p }); });
+    return api("adminData").then(function (r) {
+      var byEmail = {}; r.rows.forEach(function (x) { (byEmail[x.email] = byEmail[x.email] || {})[x.key] = x.data; });
+      var people = r.invites.map(function (i) { var mods = byEmail[i.email]; return { email: i.email, name: i.name || i.email, role: i.role, invitedAt: i.invitedAt, prog: mods ? { modules: mods, lastActive: i.lastActive } : (i.lastActive ? { modules: {}, lastActive: i.lastActive } : null) }; });
+      Object.keys(byEmail).forEach(function (e) { if (!r.invites.some(function (i) { return i.email === e; })) people.push({ email: e, name: e, role: "removed", prog: { modules: byEmail[e], lastActive: 0 } }); });
       people.sort(function (a, b) { return doneCount(b) - doneCount(a) || a.name.localeCompare(b.name); });
       S.adminCache = { people: people, at: NOW() }; return S.adminCache;
     });
@@ -379,15 +393,15 @@
   }
   function vAdminInvite(data) {
     var list = data.people.filter(function (p) { return p.role !== "removed"; });
-    show(adminTabs("#admin/invite") + '<div class="two view"><section class="card"><h2>Invite one person</h2><form id="one" style="display:flex;flex-direction:column;gap:10px"><label class="f" for="iname">Name<input id="iname" type="text" required placeholder="First and last name"></label><label class="f" for="iemail">Work email<input id="iemail" type="email" required></label><label class="f" for="irole">Role<select id="irole"><option value="learner">Learner</option><option value="admin">Admin (sees everyone’s progress)</option></select></label><button class="btn go" type="submit">Add to the invite list</button></form><p class="small muted">They then go to the Academy link and sign in with this email. Nothing is emailed automatically: send them the link in Teams.</p></section>' +
+    show(adminTabs("#admin/invite") + '<div class="two view"><section class="card"><h2>Invite one person</h2><form id="one" style="display:flex;flex-direction:column;gap:10px"><label class="f" for="iname">Name<input id="iname" type="text" required placeholder="First and last name"></label><label class="f" for="iemail">Work email<input id="iemail" type="email" required></label><label class="f" for="irole">Role<select id="irole"><option value="learner">Learner</option><option value="admin">Admin (sees everyone’s progress)</option></select></label><button class="btn go" type="submit">Add to the invite list</button></form><p class="small muted">They then go to the Academy link and sign in with this email. Nothing is emailed on invite: send them the link in Teams. You can also add rows straight in the Invites sheet.</p></section>' +
       '<section class="card"><h2>Invite several</h2><p class="small muted">One person per line: <code>Name, email</code></p><textarea id="bulk" placeholder="Amani Kibet, amani@lastmileclimate.org"></textarea><button class="btn" id="addbulk" type="button">Add all as learners</button><div id="bmsg"></div></section></div>' +
-      '<section class="card view"><h2>On the list (' + list.length + ')</h2><div class="tablewrap"><table><thead><tr><th>Name</th><th>Email</th><th>Role</th><th>Signed in</th><th></th></tr></thead><tbody>' + list.map(function (p) { return "<tr><td>" + esc(p.name) + "</td><td>" + esc(p.email) + "</td><td>" + esc(p.role) + "</td><td>" + (p.prog ? "Yes" : "Not yet") + "</td><td>" + (p.email === S.user.email.toLowerCase() ? "" : '<button class="btn alt small" data-rm="' + esc(p.email) + '">Remove</button>') + "</td></tr>"; }).join("") + "</tbody></table></div><p class=\"small muted\">Removing someone stops their access. Their progress stays in the records.</p></section>", "#admin");
-    function add(name, email, role) { email = email.trim().toLowerCase(); return db.collection("allow").doc(email).set({ name: name.trim(), role: role, invitedAt: NOW(), invitedBy: S.user.email.toLowerCase() }); }
+      '<section class="card view"><h2>On the list (' + list.length + ')</h2><div class="tablewrap"><table><thead><tr><th>Name</th><th>Email</th><th>Role</th><th>Signed in</th><th></th></tr></thead><tbody>' + list.map(function (p) { return "<tr><td>" + esc(p.name) + "</td><td>" + esc(p.email) + "</td><td>" + esc(p.role) + "</td><td>" + (p.prog ? "Yes" : "Not yet") + "</td><td>" + (p.email === S.prog.email ? "" : '<button class="btn alt small" data-rm="' + esc(p.email) + '">Remove</button>') + "</td></tr>"; }).join("") + "</tbody></table></div><p class=\"small muted\">Removing someone stops their access. Their progress stays in the records.</p></section>", "#admin");
+    function add(name, email, role) { return api("invite", { people: [{ name: name.trim(), email: email.trim().toLowerCase(), role: role }] }); }
     $("#one").addEventListener("submit", function (e) { e.preventDefault(); add($("#iname").value, $("#iemail").value, $("#irole").value).then(function () { toast("Added."); S.adminCache = null; vAdmin(["admin", "invite"]); }).catch(function (er) { toast("Couldn't add: " + er.message); }); });
     $("#addbulk").addEventListener("click", function () { var lines = $("#bulk").value.split(/\n/).map(function (l) { return l.split(/[,;\t]/); }).filter(function (p) { return p.length >= 2 && /@/.test(p[p.length - 1]); });
       if (!lines.length) { $("#bmsg").innerHTML = '<p class="err">No lines in the format “Name, email” found.</p>'; return; }
-      Promise.all(lines.map(function (p) { return add(p.slice(0, -1).join(" "), p[p.length - 1], "learner"); })).then(function () { toast(lines.length + " added."); S.adminCache = null; vAdmin(["admin", "invite"]); }).catch(function (er) { $("#bmsg").innerHTML = '<p class="err">' + esc(er.message) + "</p>"; }); });
-    on("[data-rm]", "click", function () { var em = this.dataset.rm, b = this; if (b.dataset.sure !== "1") { b.dataset.sure = "1"; b.textContent = "Click again to remove"; return; } db.collection("allow").doc(em).delete().then(function () { toast("Removed."); S.adminCache = null; vAdmin(["admin", "invite"]); }); });
+      api("invite", { people: lines.map(function (p) { return { name: p.slice(0, -1).join(" ").trim(), email: p[p.length - 1].trim().toLowerCase(), role: "learner" }; }) }).then(function () { toast(lines.length + " added."); S.adminCache = null; vAdmin(["admin", "invite"]); }).catch(function (er) { $("#bmsg").innerHTML = '<p class="err">' + esc(er.message) + "</p>"; }); });
+    on("[data-rm]", "click", function () { var em = this.dataset.rm, b = this; if (b.dataset.sure !== "1") { b.dataset.sure = "1"; b.textContent = "Click again to remove"; return; } api("uninvite", { email: em }).then(function () { toast("Removed."); S.adminCache = null; vAdmin(["admin", "invite"]); }); });
   }
   function validateContent(c) {
     if (!c || !Array.isArray(c.modules) || !Array.isArray(c.stages) || !c.version) return "Missing version, stages or modules.";
@@ -397,17 +411,19 @@
   function vAdminContent() {
     show(adminTabs("#admin/content") + '<section class="card view"><h2>Handbook content</h2>' + (S.content ? '<p>Loaded: version <b>' + esc(S.contentVersion) + "</b> · " + mods().length + " modules.</p>" : '<p class="note">No content loaded yet. Load the <code>content.json</code> file you received.</p>') +
       '<label class="f" for="file">Load a content file (content.json)<input type="file" id="file" accept="application/json,.json"></label><div id="cmsg"></div>' +
-      '<p class="small muted">The content is stored in your Firebase project, visible only to signed-in invited people. It’s not in the public code. Loading a new version keeps everyone’s progress; the dashboard records which version each person completed.</p>' + (S.content ? '<div class="btns"><button class="btn alt small" id="dl">Download the current content (backup)</button></div>' : "") + "</section>", "#admin");
+      '<p class="small muted">The content is stored as a private file in the Academy owner’s Google Drive, and sent only to signed-in, invited people. It’s not in the public code. Loading a new version keeps everyone’s progress; the dashboard records which version each person completed.</p>' + (S.content ? '<div class="btns"><button class="btn alt small" id="dl">Download the current content (backup)</button></div>' : "") + "</section>", "#admin");
     $("#file").addEventListener("change", function () { var f = this.files[0]; if (!f) return; var r = new FileReader(); r.onload = function () {
       var c; try { c = JSON.parse(r.result); } catch (e) { $("#cmsg").innerHTML = '<p class="err">That file isn’t valid JSON.</p>'; return; }
       var bad = validateContent(c); if (bad) { $("#cmsg").innerHTML = '<p class="err">' + esc(bad) + "</p>"; return; }
-      db.collection("content").doc("current").set({ version: c.version, json: JSON.stringify(c), updatedAt: NOW(), updatedBy: S.user.email.toLowerCase() }).then(function () {
+      $("#cmsg").innerHTML = '<p class="muted">Uploading…</p>'; api("setContent", { json: JSON.stringify(c) }).then(function () {
         S.content = c; S.contentVersion = c.version; $("#cmsg").innerHTML = '<p class="ok">Loaded version ' + esc(c.version) + " with " + c.modules.length + ' modules. <a href="#journey">Open the journey</a></p>';
       }).catch(function (e) { $("#cmsg").innerHTML = '<p class="err">' + esc(e.message) + "</p>"; }); }; r.readAsText(f); });
     var dl = $("#dl"); if (dl) dl.addEventListener("click", function () { var a = document.createElement("a"); a.href = URL.createObjectURL(new Blob([JSON.stringify(S.content, null, 1)], { type: "application/json" })); a.download = "lmc-academy-content-" + S.contentVersion + ".json"; document.body.appendChild(a); a.click(); a.remove(); });
   }
 
   /* ---------- start ---------- */
-  if (auth.isSignInWithEmailLink(location.href)) { var em = store("lmcEmail"); if (em) finishLink(em); else vConfirmEmail(); }
-  auth.onAuthStateChanged(function (u) { if (u) boot(u); else { S.user = S.prog = S.content = null; S.adminCache = null; if (!auth.isSignInWithEmailLink(location.href)) vSignin(); } });
+  var qs = new URLSearchParams(location.search);
+  if (qs.get("login")) finishLink(qs.get("login"));
+  else if (store("lmcSession")) { S.session = store("lmcSession"); boot(); }
+  else vSignin();
 })();

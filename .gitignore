@@ -7,6 +7,4 @@ prototype/
 tests/node_modules/
 tests/shots/
 tests/package-lock.json
-firestore-debug.log
-*-debug.log
 .DS_Store
